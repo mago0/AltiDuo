@@ -1,64 +1,23 @@
-/*
-  Model Rocket dual altimeter Ver 1.4
- Copyright Boris du Reau 2012-2013
- 
- This is using a BMP085 presure sensor and an Atmega 328
- The following should fire the main at apogee if it is at least 50m above ground of the launch site
- and fire the main 100m before landing
- The Arduino board that I am using to load the program is an Arduino UNO ATmega328P 
- 
- For the BMP085 pressure sensor
- Connect VCC of the BMP085 sensor to 5.0V! make sure that you are using the 5V sensor (GY-65 model)
- Connect GND to Ground
- Connect SCL to i2c clock - on 328 Arduino Uno/Duemilanove/etc thats Analog 5
- Connect SDA to i2c data - on 328 Arduino Uno/Duemilanove/etc thats Analog 4
- EOC is not used, it signifies an end of conversion
- XCLR is a reset pin, also not used here
- The micro swiches are connected on pin D6 and D7
- The main is connected to pin D8
- The apogee is connected to pin D9
- The main continuity test is connected to pin D10
- The apogee continuity test is connected to pin D11
- The speaker/buzzer is connected to pin D12
- */
-
-//////////////////////////////////////////////////////////////////////////////
-//
-//  This is beta, I have not fligh it yet. It could cause premature ejections.
-//  Damage your rocket, cause injuries etc...
-//  Do not flash your altimeter unless you agree to contribute to the testing
-//  and you do understand the risks.
-//
-/////////////////////////////////////////////////////////////////////////////
+#include <Arduino.h>
 #include <Wire.h>
 #include <EEPROM.h>
-#include <Adafruit_BMP085.h>
+#include "Adafruit_BMP3XX.h"
+typedef Adafruit_BMP3XX Barometer;
+#include "Configure.h"
+#include "Message.h"
 
-#define MAJOR_VERSION 1
-#define MINOR_VERSION 4
+const double SEA_LEVEL_PRESSURE = 1013.7;
 
-// Turn on Serial Console
-#define DEBUG //=true
+Barometer bmp;
 
-// Use Metric (meters) for altitude reporting
-///#define METRIC_UNIT
-#undef METRIC_UNIT
+hw_timer_t * timer0 = NULL;
 
-// Use altitude reporting format beeping for each digit
-#define BEEP_DIGIT
-//#undef BEEP_DIGIT
+// Double buffer for altitude
+volatile int altitudeBufferIndex = 0;
+const int altitudeBufferSize = 2;
+int altitudeBuffer[altitudeBufferSize] = {0, 0};
 
-// Use tone command to generate beeps. Undefine if using led for reporting
-#define USE_TONE
-//#undef USE_TONE
-
-#ifdef METRIC_UNIT
-#define FEET_IN_METER 1.0
-#else
-#define FEET_IN_METER 3.28084
-#endif
-
-Adafruit_BMP085 bmp;
+volatile SemaphoreHandle_t altitudeSemaphore;
 
 //ground level altitude
 long initialAltitude;
@@ -69,277 +28,256 @@ long apogeeAltitude;
 long mainAltitude;
 long liftoffAltitude;
 long lastAltitude;
+long landingAltitude;
+
 //Our drogue has been ejected i.e: apogee has been detected
-boolean apogeeHasFired =false;
-boolean mainHasFired=false;
+boolean mainHasFired =false;
 boolean apogeeSaved = false;
 //nbr of measures to do so that we are sure that apogee has been reached 
-unsigned long measures;
+unsigned long apogeeMeasures;
 unsigned long mainDeployAltitude;
 
-const int pinAltitude1 = 8;
-const int pinAltitude2 = 7;
+const byte PIN_I2C_SDA            = 23;
+const byte PIN_I2C_SCL            = 22;
+const byte PIN_SD_CS              = 16; 
+const byte PIN_ALTITUDE           = 32;
+const byte PIN_APOGEE             = 33;
+const byte PIN_MAIN               = 15;
+const byte PIN_APOGEE_CONTINUITY  = 12;
+const byte PIN_MAIN_CONTINUITY    = 27;
+const byte PIN_SPEAKER            = 14;
+const byte PIN_LED_OK             = 17;
+const byte PIN_LED_MSG            = 4;
 
-const int pinApogee = 9;
-const int pinMain = 13;
-const int pinApogeeContinuity = 10;
-const int pinMainContinuity = 11;
-const int pinSpeaker = 12;
+struct KalmanFilter {
+  float f_1 = 1.00000; // cast as float
+  float x;
+  float x_last;
+  float p;
+  float p_last;
+  float k;
+  float q;
+  float r;
+  float x_temp;
+  float p_temp;
+};
 
-//Kalman Variables
-float f_1=1.00000;  //cast as float
-float kalman_x;
-float kalman_x_last;
-float kalman_p;
-float kalman_p_last;
-float kalman_k;
-float kalman_q;
-float kalman_r;
-float kalman_x_temp;
-float kalman_p_temp;
-//end of Kalman Variables
+KalmanFilter kalman;
 
-void setup()
-{
-  int val = 0;     // variable to store the read value
-  int val1 = 0;     // variable to store the read value
-  
-  //init Kalman filter
+enum RocketState {
+  PAD,
+  ASCENDING,
+  DESCENDING,
+  LANDED
+};
+
+RocketState currentState;
+
+void setup() {
   KalmanInit();
   
-#ifdef DEBUG
-  // initialize the serial communication for debuging
-  Serial.begin(9600);
-#endif
+  #ifdef DEBUG
+  Serial.begin(115200);
+  #endif
   
-  Wire.begin();
   //Presure Sensor Initialisation
-  bmp.begin();
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  if (!bmp.begin_I2C()) {
+    #ifdef DEBUG
+    Serial.println("Barometer Failed");
+    #endif
+    while(1);
+  }
+
   //our drogue has not been fired
-  apogeeHasFired=false;
   mainHasFired=false;
   
   //Initialise the output pin
-  pinMode(pinApogee, OUTPUT);
-  pinMode(pinMain, OUTPUT);
-  pinMode(pinSpeaker, OUTPUT);
+  pinMode(PIN_APOGEE, OUTPUT);
+  pinMode(PIN_MAIN, OUTPUT);
+  pinMode(PIN_SPEAKER, OUTPUT);
+  pinMode(PIN_LED_OK, OUTPUT);
+  pinMode(PIN_LED_MSG, OUTPUT);
   
-  pinMode(pinAltitude1, INPUT);
-  pinMode(pinAltitude2, INPUT);
+  pinMode(PIN_ALTITUDE, INPUT);
   
-  pinMode(pinApogeeContinuity, INPUT);
-  pinMode(pinMainContinuity, INPUT);
+  pinMode(PIN_APOGEE_CONTINUITY, INPUT);
+  pinMode(PIN_MAIN_CONTINUITY, INPUT);
   //Make sure that the output are turned off
-  digitalWrite(pinApogee, LOW);
-  digitalWrite(pinMain, LOW);
-  digitalWrite(pinSpeaker, LOW);
+  digitalWrite(PIN_APOGEE, LOW);
+  digitalWrite(PIN_MAIN, LOW);
+  digitalWrite(PIN_SPEAKER, LOW);
   
   //initialisation give the version of the altimeter
   //One long beep per major number and One short beep per minor revision
   //For example version 1.2 would be one long beep and 2 short beep
-  beepAltiVersion(MAJOR_VERSION,MINOR_VERSION);
- 
+  beepAltiVersion(MAJOR_VERSION, MINOR_VERSION);
  
   // Read in the previous altitude
   int previousApogee = readPreviousApogee();
   if (previousApogee > 0 ) {
 
     previousApogee *= FEET_IN_METER;
-   for( int repeat =0; repeat < 2; repeat++) {   
-    #ifdef BEEP_DIGIT 
-      beepAltitudeNew(previousApogee);
-    #else
+    for (int repeat = 0; repeat < 2; repeat++) {   
       beepAltitude(previousApogee);
-    #endif
 
-    delay(1000);
+      delay(1000);
    }
   }
   
   //number of measures to do to detect Apogee
-  measures = 10;
+  apogeeMeasures = 10;
   
-  //initialise the deployement altitude for the main 
-  mainDeployAltitude = 100;
+  initialAltitude = getInitialAltitude();
 
-  // On the Alti duo when you close the jumper you set it to 1
-  // val is the left jumper and val1 is the right jumper
-  val = digitalRead(pinAltitude1); 
-  val1 = digitalRead(pinAltitude2);  
-  if(val == 0 && val1 ==0)
-  {
-    mainDeployAltitude = 50;
+  // Read the deployment altitude from the potentiometer
+  mainDeployAltitude = readDeploymentAltitude();
+  
+  lastAltitude = 0; 
+  liftoffAltitude = 20;
+  landingAltitude = 10;
+
+  altitudeSemaphore = xSemaphoreCreateBinary();
+
+  timer0 = timerBegin(0, 80, true); // Use timer 0, prescaler 80 (1MHz), count up
+  timerAttachInterrupt(timer0, &timerHandlerAltitude, true); // Attach the interrupt function
+  timerAlarmWrite(timer0, 20000, true); // Set timer for 50Hz frequency (1 second / 50 = 0.02 seconds or 20,000 microseconds)
+
+  initializeMsgTimer();
+
+  currentState = PAD; 
+  digitalWrite(PIN_LED_OK, HIGH);
+}
+
+void loop() {
+  if (takeAltitudeSemaphore()) {
+    currAltitude = KalmanCalc(readAltitudeBuffer()) - initialAltitude;
   }
-  if(val == 0 && val1 ==1)
-  {
-    mainDeployAltitude = 100;
+  Serial.println("Current Altitude: " + String(currAltitude) + " meters");
+
+  switch (currentState) {
+  case PAD:
+    if (currAltitude < liftoffAltitude) {
+      #ifdef CONTINUITY_CHECK
+      continuityCheck();      
+      #endif
+    } else {
+      currentState = ASCENDING;
+    }
+    break;
+  
+  case ASCENDING:
+    if (currAltitude < lastAltitude) {
+      apogeeMeasures = apogeeMeasures - 1;
+      if (apogeeMeasures == 0) {
+        //fire drogue
+        currentState = DESCENDING;
+        digitalWrite(PIN_APOGEE, HIGH);
+        delay (2000);
+        digitalWrite(PIN_APOGEE, LOW);
+        apogeeAltitude = currAltitude;
+      }  
+    } else {
+      lastAltitude = currAltitude;
+      apogeeMeasures = 10;
+    } 
+    break;
+
+  case DESCENDING:
+    if (mainHasFired == false && currAltitude < mainDeployAltitude) {
+      digitalWrite(PIN_MAIN, HIGH);
+      delay(2000);
+      mainHasFired = true;
+      mainAltitude = currAltitude;
+      digitalWrite(PIN_MAIN, LOW);
+    }
+
+    if (mainHasFired == true && currAltitude < landingAltitude) {
+      currentState = LANDED;
+      timerEnd(timer0);
+      if(apogeeSaved == false ) {
+        writePreviousApogee(apogeeAltitude); 
+        apogeeSaved = true;
+      }
+
+      beginBeepSeq();
+
+      beepAltitude(apogeeAltitude * FEET_IN_METER);
+
+      delay(1000);
+    }
+    break;
+
+  default:
+    break;
   }
-  if(val == 1 && val1 ==0)
-  {
-    mainDeployAltitude = 150;
+}
+
+void ARDUINO_ISR_ATTR timerHandlerAltitude() {
+  writeAltitudeBuffer(bmp.readAltitude(SEA_LEVEL_PRESSURE));
+  switchAltitudeBuffer();
+  xSemaphoreGiveFromISR(altitudeSemaphore, NULL);
+}
+
+enum ContinuityCheckType {
+  CHECK_APOGEE = 0,
+  CHECK_MAIN = 1
+};
+
+ContinuityCheckType nextContinuityCheckType = CHECK_APOGEE;
+unsigned long lastContinuityCheckTime = 0;
+
+void continuityCheck() {
+  byte msgCount = 1;
+  byte pin = PIN_APOGEE_CONTINUITY;
+  if (nextContinuityCheckType == CHECK_MAIN) {
+    msgCount = 2;
+    pin = PIN_MAIN_CONTINUITY;
   }
-  if(val == 1 && val1 ==1)
-  {
-    mainDeployAltitude = 200;
+  if ((millis() - lastContinuityCheckTime) > 2000) {
+    int continuityValue = digitalRead(pin);
+    if (continuityValue == 0) {
+      startMsgTimerSequence(1000, 250, msgCount);
+    } else {
+      startMsgTimerSequence(250, 250, msgCount);
+    }
+    // Toggle the check type for the next call
+    nextContinuityCheckType = (nextContinuityCheckType == CHECK_APOGEE) ? CHECK_MAIN : CHECK_APOGEE;
+    lastContinuityCheckTime = millis();
   }
+}
+
+int getInitialAltitude() {
+  bmp.readAltitude(SEA_LEVEL_PRESSURE); // throw away the first reading
   // let's do some dummy altitude reading
   // to initialise the Kalman filter
   for (int i=0; i<50; i++){
-    KalmanCalc(bmp.readAltitude());
-   }
+    KalmanCalc(bmp.readAltitude(SEA_LEVEL_PRESSURE));
+  }
   //let's read the lauch site altitude
   long sum = 0;
   long curr = 0;
   for (int i=0; i<10; i++){
-    curr =KalmanCalc(bmp.readAltitude());
+    curr = KalmanCalc(bmp.readAltitude(SEA_LEVEL_PRESSURE));
     sum += curr;
     delay(50); }
-  initialAltitude = (sum / 10.0);
-  
-  lastAltitude = 0; 
-
-  liftoffAltitude = 20;
-
+  int initialAltitude = (sum / 10.0);
+  #ifdef DEBUG
+  Serial.println("Initial Altitude: " + String(initialAltitude) + " meters");
+  #endif
+  return initialAltitude;
 }
 
-void loop()
-{
-  //read current altitude
-  currAltitude = (KalmanCalc(bmp.readAltitude())- initialAltitude);
-
-  if (( currAltitude > liftoffAltitude) != true)
-  {
-    continuityCheck(pinApogeeContinuity,1);
-    delay(500);
-    continuityCheck(pinMainContinuity,2);
-    delay(500);
-  }
-  
-  //detect apogee
-  if(currAltitude > liftoffAltitude)
-  {
-
-    if (currAltitude < lastAltitude)
-    {
-      measures = measures - 1;
-      if (measures == 0)
-      {
-        //fire drogue
-        digitalWrite(pinApogee, HIGH);
-        delay (2000);
-        apogeeHasFired=true;
-        digitalWrite(pinApogee, LOW);
-        apogeeAltitude = currAltitude;
-      }  
-    }
-    else 
-    {
-      lastAltitude = currAltitude;
-      measures = 10;
-    } 
-  }
-
- 
-  if ((currAltitude  < mainDeployAltitude) && apogeeHasFired == true && mainHasFired==false)
-  {
-    // Deploy main chute  100m before landing...
-    digitalWrite(pinMain, HIGH);
-    delay(2000);
-    mainHasFired=true;
-    mainAltitude= currAltitude;
-    digitalWrite(pinMain, LOW);
-  }
-  if(apogeeHasFired == true && mainHasFired==true)
-  {
-    if(apogeeSaved == false ) {
-      writePreviousApogee(apogeeAltitude); 
-      apogeeSaved = true;
-    }
-    
-    beginBeepSeq();
-    
-    #ifdef BEEP_DIGIT 
-      beepAltitudeNew(apogeeAltitude * FEET_IN_METER);
-    #else
-      beepAltitude(apogeeAltitude * FEET_IN_METER);
-    #endif
-
-    delay(1000);
-  }
-}
-
-void continuityCheck(int pin, int beeps)
-{
-    #ifdef DEBUG
-    Serial.print("continuity check pin:" );
-    Serial.print(pin);
-    Serial.print(" beeps:");
-    Serial.println(beeps);
-    #endif
-
-  int val = 0;     // variable to store the read value
-  // read the input pin to check the continuity if apogee has not fired
-  if (apogeeHasFired == false )
-  {
-    val = digitalRead(pin);
-    #ifdef DEBUG
-    Serial.print("   value:" );
-    Serial.println(val);
-    #endif
-    if (val == 0)
-    {
-      longBeepRepeat(beeps);
-    }
-    else
-    {
-      shortBeepRepeat(beeps);
-    }
-  }
-}
-
-
-///////////////////////////////////////////////////////////////
-// fonction to beep the altitude in feet or meter
-//
-///////////////////////////////////////////////////////////
-void beepAltitude(long altitude)
-{
-  int nbrLongBeep=0;
-  int nbrShortBeep=0;
-  int i;
-  
-  // this is the last thing that I need to write, some code to beep the altitude
-  //altitude is in meters
-  //find how many digits
-  if(altitude > 99)
-  {
-    // 1 long beep per hundred meter
-    nbrLongBeep= int(altitude /100);
-    //then calculate the number of short beep
-    nbrShortBeep = (altitude - (nbrLongBeep * 100)) / 10;
-  } 
-  else
-  {
-    nbrLongBeep = 0;
-    nbrShortBeep = (altitude/10);
-  }
-  if (nbrLongBeep > 0) {
-    shortBeepRepeat( nbrLongBeep );
-  }
-
-  if (nbrShortBeep > 0) {
-    shortBeepRepeat( nbrShortBeep );
-  }
-  
-  delay(5000);
-
+int readDeploymentAltitude() {
+  int altitudeSetting = analogRead(PIN_ALTITUDE); // Read the analog value from the potentiometer
+  int deploymentAltitude = map(altitudeSetting, 0, 1023, 100, 500); // Map the value to a range of 100 to 500 meters
+  #ifdef DEBUG
+  Serial.println("Main Deployment Altitude set to: " + String(deploymentAltitude) + " meters");
+  #endif
+  return deploymentAltitude;
 }
 
 void longBeepRepeat( int digit ) {
-    #ifdef DEBUG
-    Serial.println("longBeepRepeat: " );
-    Serial.println( digit);
-    #endif
   int i;
   for( i=0; i< digit; i++ ) {
     if( i > 0 ) {
@@ -350,10 +288,6 @@ void longBeepRepeat( int digit ) {
 }
 
 void shortBeepRepeat( int digit ) {
-    #ifdef DEBUG
-    Serial.println("shortBeepRepeat: " );
-    Serial.println( digit);
-    #endif
   int i;
   for( i=0; i< digit; i++ ) {
     if( i > 0 ) {
@@ -363,47 +297,41 @@ void shortBeepRepeat( int digit ) {
   }
 }
 
-void beginBeepSeq()
-{
+void beginBeepSeq() {
   int i=0;
-  #ifdef USE_TONE
-    for (i=0; i<10;i++)
-    {
-      tone(pinSpeaker, 1600,1000);
-      delay(50);
-      noTone(pinSpeaker);
-    }
-    delay(1000);
+  for (i=0; i<10; i++) {
+    tone(PIN_SPEAKER, 1600,1000);
+    digitalWrite(PIN_LED_MSG, HIGH);
+    delay(50);
+    noTone(PIN_SPEAKER);
+    digitalWrite(PIN_LED_MSG, LOW);
+  }
+  delay(1000);
+}
+void longBeep() {
+  #ifdef DEBUG
+  digitalWrite(PIN_LED_MSG, HIGH);
+  delay(1000);
+  digitalWrite(PIN_LED_MSG, LOW);
+  #else
+  digitalWrite(PIN_LED_MSG, HIGH);
+  tone(PIN_SPEAKER, 600,1000);
+  delay(1000);
+  digitalWrite(PIN_LED_MSG, LOW);
+  noTone(PIN_SPEAKER);
   #endif
 }
-void longBeep()
-{
-    #ifdef DEBUG
-    Serial.println("<<longBeep>>" );
-    #endif
-  #ifdef USE_TONE
-    tone(pinSpeaker, 600,1000);
-    delay(1000);
-    noTone(pinSpeaker);
+void shortBeep() {
+  #ifdef DEBUG
+  digitalWrite(PIN_LED_MSG, HIGH);
+  delay(250);
+  digitalWrite(PIN_LED_MSG, LOW);
   #else
-    digitalWrite(pinSpeaker, 1); // Toggle on/off
-    delay(1000);
-    digitalWrite(pinSpeaker, 0);
-  #endif
-}
-void shortBeep()
-{
-    #ifdef DEBUG
-    Serial.println("<<shortBeep>>" );
-    #endif
-  #ifdef USE_TONE
-    tone(pinSpeaker, 600,250);
-    delay(250);
-    noTone(pinSpeaker);
-  #else
-    digitalWrite(pinSpeaker, 1);
-    delay(250);
-    digitalWrite(pinSpeaker, 0)
+  tone(PIN_SPEAKER, 600,250);
+  digitalWrite(PIN_LED_MSG, HIGH);
+  delay(250);
+  noTone(PIN_SPEAKER);
+  digitalWrite(PIN_LED_MSG, LOW);
   #endif
 }
 
@@ -414,56 +342,53 @@ void shortBeep()
 //Call KalmanInit() once.  
 
 //KalmanInit() - Call before any iterations of KalmanCalc()
-void KalmanInit()
-{
-   kalman_q=4.0001;  //filter parameters, you can play around with them
-   kalman_r=.20001;  // but these values appear to be fairly optimal
+void KalmanInit() {
+  kalman.q = 4.0001;  //filter parameters, you can play around with them
+  kalman.r = .20001;  // but these values appear to be fairly optimal
 
-   kalman_x = 0;
-   kalman_p = 0;
-   kalman_x_temp = 0;
-   kalman_p_temp = 0;
-   
-   kalman_x_last = 0;
-   kalman_p_last = 0;
-   
+  kalman.x = 0;
+  kalman.p = 0;
+  kalman.x_temp = 0;
+  kalman.p_temp = 0;
+  
+  kalman.x_last = 0;
+  kalman.p_last = 0;
 }
 
 //KalmanCalc() - Calculates new Kalman values from float value "altitude"
 // This will be the ASL altitude during the flight, and the AGL altitude during dumps
-float KalmanCalc (float altitude)
-{
-   
-   //Predict kalman_x_temp, kalman_p_temp
-   kalman_x_temp = kalman_x_last;
-   kalman_p_temp = kalman_p_last + kalman_r;
-   
-   //Update kalman values
-   kalman_k = (f_1/(kalman_p_temp + kalman_q)) * kalman_p_temp;
-   kalman_x = kalman_x_temp + (kalman_k * (altitude - kalman_x_temp));
-   kalman_p = (f_1 - kalman_k) * kalman_p_temp;
-   
-   //Save this state for next time
-   kalman_x_last = kalman_x;
-   kalman_p_last = kalman_p;
-   
-   //Assign current Kalman filtered altitude to working variables
-   //KAlt = kalman_x; //FLOAT Kalman-filtered altitude value
-  return kalman_x;
+float KalmanCalc (float altitude) {
+  //Predict kalman.x_temp, kalman.p_temp
+  kalman.x_temp = kalman.x_last;
+  kalman.p_temp = kalman.p_last + kalman.r;
+  
+  //Update kalman values
+  kalman.k = (kalman.f_1 / (kalman.p_temp + kalman.q)) * kalman.p_temp;
+  kalman.x = kalman.x_temp + (kalman.k * (altitude - kalman.x_temp));
+  kalman.p = (kalman.f_1 - kalman.k) * kalman.p_temp;
+  
+  //Save this state for next time
+  kalman.x_last = kalman.x;
+  kalman.p_last = kalman.p;
+  
+  //Assign current Kalman filtered altitude to working variables
+  //KAlt = kalman.x; //FLOAT Kalman-filtered altitude value
+  return kalman.x;
 }  
 
-void beepAltiVersion (int majorNbr, int minorNbr)
-{
-    #ifdef DEBUG
-    Serial.println("Major Version:");
-    Serial.println( majorNbr);
-    Serial.println("Minor Version:");
-    Serial.println( minorNbr);
-    #endif
+void beepAltiVersion (int majorNbr, int minorNbr) {
+  #ifdef DEBUG
+  Serial.println("Major Version:");
+  Serial.println( majorNbr);
+  Serial.println("Minor Version:");
+  Serial.println( minorNbr);
+  #endif
 
   longBeepRepeat(majorNbr);
+  digitalWrite(PIN_LED_MSG, HIGH);
   delay(250);
   shortBeepRepeat(minorNbr);
+  digitalWrite(PIN_LED_MSG, LOW);
   delay(1000);
 }
 
@@ -473,20 +398,18 @@ void beepAltiVersion (int majorNbr, int minorNbr)
   Output the maximum achieved altitude (apogee) via flashing LED / Buzzer
 
  *************************************************************************/
-void beepAltitudeNew(uint32_t value)
-{
-  char Apogee_String[5];                        // Create an array with a buffer of 5 digits
+void beepAltitude(uint32_t value) {
+  char Apogee_String[5];                      // Create an array with a buffer of 5 digits
 
-  ultoa(value, Apogee_String, 10);              // Convert unsigned long to string array, radix 10 for decimal
-  uint8_t length = strlen(Apogee_String);       // Get string length
+  ultoa(value, Apogee_String, 10);            // Convert unsigned long to string array, radix 10 for decimal
+  uint8_t length = strlen(Apogee_String);     // Get string length
 
-  delay(3000);                                  // Pause for 3 seconds
+  delay(3000);                                // Pause for 3 seconds
 
-  for(uint8_t i = 0; i < length; i++ )
-  {
-    delay(1000);                                // Pause 1 second for every digit output
+  for(uint8_t i = 0; i < length; i++ ) {
+    delay(1000);                              // Pause 1 second for every digit output
 
-    uint8_t digit = (Apogee_String[i] - '0');   // Convert ASCI to actual numerical digit
+    uint8_t digit = (Apogee_String[i] - '0'); // Convert ASCI to actual numerical digit
     if ( digit == 0 ) {
       digit = 10;
     }
@@ -513,7 +436,7 @@ int readPreviousApogee() {
   ConfigStruct config;
   
   int i;
-  for( i=0; i< sizeof(config); i++ ) {
+  for( i = 0; i < sizeof(config); i++ ) {
     *((char*)&config + i) = EEPROM.read(CONFIG_START + i);
   }
   // Verify:
@@ -531,7 +454,6 @@ int readPreviousApogee() {
   }
   
   return config.altitude;
-  
 }
 
 int writePreviousApogee( int altitude ) {
@@ -554,3 +476,21 @@ int writePreviousApogee( int altitude ) {
  }
 }
 
+// Double buffer for altitude
+
+void switchAltitudeBuffer() {
+  altitudeBufferIndex = (altitudeBufferIndex + 1) % altitudeBufferSize;
+}
+
+int readAltitudeBuffer() {
+  int readIndex = (altitudeBufferIndex + 1) % altitudeBufferSize;
+  return altitudeBuffer[readIndex];
+}
+
+void writeAltitudeBuffer(int altitude) {
+  altitudeBuffer[altitudeBufferIndex] = altitude;
+}
+
+bool takeAltitudeSemaphore() {
+  return xSemaphoreTake(altitudeSemaphore, 0) == pdTRUE;
+}
