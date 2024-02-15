@@ -112,15 +112,3 @@ void beep(bool isLongBeep) {
   noTone(PIN_SPEAKER);
   #endif
 }
-
-void beginBeepSeq() {
-  int i=0;
-  for (i=0; i<10; i++) {
-    tone(PIN_SPEAKER, 1600,1000);
-    digitalWrite(PIN_LED_MSG, HIGH);
-    delay(50);
-    noTone(PIN_SPEAKER);
-    digitalWrite(PIN_LED_MSG, LOW);
-  }
-  delay(1000);
-}

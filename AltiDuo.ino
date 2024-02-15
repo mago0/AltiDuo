@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <EEPROM.h>
 #include "Adafruit_BMP3XX.h"
 typedef Adafruit_BMP3XX Barometer;
 #include "Configure.h"
@@ -28,10 +27,12 @@ long lastAltitude;    // Last recorded altitude
 long apogeeAltitude;  // Maximum altitude reached (apogee)
 long mainAltitude;    // Altitude for main parachute deployment
 
+unsigned long liftoffTime = 0;
+
 // Apogee detection and parachute deployment variables
 boolean mainHasFired = false; // Indicates if the main parachute has been deployed
-unsigned long apogeeFireTime = 0; // Time when the apogee parachute was deployed
-unsigned long mainFireTime = 0;   // Time when the main parachute was deployed
+unsigned long apogeeTime = 0; // Time when the apogee parachute was deployed
+unsigned long mainTime = 0;   // Time when the main parachute was deployed
 boolean apogeeSaved = false;      // Indicates if apogee data has been saved
 unsigned long mainDeployAltitude; // Altitude for main parachute deployment
 
@@ -67,6 +68,10 @@ enum ContinuityCheckType {
 };
 ContinuityCheckType nextContinuityCheckType = CHECK_APOGEE;
 
+// Simulation variables
+long simulatedAltitude = 0;
+bool isAscending = true;
+
 void setup() {
   #ifdef DEBUG
   Serial.begin(115200);
@@ -93,20 +98,11 @@ void setup() {
   pinMode(PIN_ALTITUDE, INPUT);
   pinMode(PIN_APOGEE_CONTINUITY, INPUT);
   pinMode(PIN_MAIN_CONTINUITY, INPUT);
+  pinMode(PIN_TEST, INPUT_PULLUP);
 
   // Beeper Initialization
   beeperInit();
   beepAltiVersion(MAJOR_VERSION, MINOR_VERSION); // Indicate the version of the altimeter with beeps
-
-  // Read and beep the previous apogee altitude
-  int previousApogee = readPreviousApogee();
-  if (previousApogee > 0) {
-    previousApogee *= FEET_IN_METER;
-    for (int repeat = 0; repeat < 2; repeat++) {
-      beepAltitude(previousApogee);
-      delay(1000);
-    }
-  }
 
   // Get initial altitude and set deployment altitudes
   initialAltitude = getInitialAltitude();
@@ -118,6 +114,7 @@ void setup() {
   timer0 = timerBegin(0, 80, true); // Use timer 0, prescaler 80 (1MHz), count up
   timerAttachInterrupt(timer0, &timerHandlerAltitude, true); // Attach the interrupt function
   timerAlarmWrite(timer0, 20000, true); // Set timer for 50Hz frequency (20,000 microseconds)
+  timerAlarmEnable(timer0);
 
   // Initialize the beeper timer for asynchronous beeping
   initBeeperTimer();
@@ -130,11 +127,16 @@ void setup() {
 byte remainingApogeeMeasures = APOGEE_MEASURES;
 
 void loop() {
+  // refresh altitude on 50Hz timer
   if (takeAltitudeSemaphore()) {
-    currAltitude = KalmanCalc(readAltitudeBuffer()) - initialAltitude;
+    if (digitalRead(PIN_TEST) == LOW) {
+      currAltitude = simulateFlightData();
+    } else {
+      currAltitude = KalmanCalc(bmp.readAltitude(SEA_LEVEL_PRESSURE)) - initialAltitude;
+    }
   }
-  if (currAltitude != lastAltitude) {
-    log("Alt: " + String(currAltitude) + " meters");
+  if (currAltitude != lastAltitude && currAltitude % 100 == 0) {
+    log("Altitude: " + String(currAltitude) + " meters");
   }
 
   switch (currentState) {
@@ -144,48 +146,47 @@ void loop() {
       continuityCheck();      
       #endif
     } else {
+      log("ASCENDING");
       currentState = ASCENDING;
     }
     break;
   
   case ASCENDING:
     if (currAltitude < lastAltitude) {
-      remainingApogeeMeasures--;
+      remainingApogeeMeasures = remainingApogeeMeasures - 1;
       if (remainingApogeeMeasures == 0) {
         //fire drogue
+        log("APOGEE");
         currentState = DESCENDING;
         digitalWrite(PIN_APOGEE, HIGH);
-        apogeeFireTime = millis(); // Record the time when the apogee parachute was deployed
+        apogeeTime = millis() - liftoffTime;
         apogeeAltitude = currAltitude;
       }  
-    } else {
-      remainingApogeeMeasures = APOGEE_MEASURES;
     }
     break;
 
   case DESCENDING:
-    if (mainFireTime == 0 && currAltitude < mainDeployAltitude) {
+    if (mainTime == 0 && currAltitude < mainDeployAltitude) {
+      log("MAIN");
       digitalWrite(PIN_MAIN, HIGH);
-      mainFireTime = millis(); // Record the time when the main parachute was deployed
+      mainTime = millis() - liftoffTime;
       mainAltitude = currAltitude;
-      digitalWrite(PIN_MAIN, LOW);
     }
 
-    if (mainFireTime > 0 && currAltitude < LANDING_ALTITUDE) {
+    if (mainTime > 0 && currAltitude < LANDING_ALTITUDE) {
+      log("LANDED");
       currentState = LANDED;
       timerEnd(timer0);
-      if(!apogeeSaved) {
-        writePreviousApogee(apogeeAltitude); 
-        apogeeSaved = true;
-      }
-
-      beginBeepSeq();
-
-      beepAltitude(apogeeAltitude * FEET_IN_METER);
-
-      delay(1000);
+      // if(!apogeeSaved) {
+      //   writePreviousApogee(apogeeAltitude);
+      //   apogeeSaved = true;
+      // }
     }
     break;
+
+  case LANDED:
+    report();
+    delay(1000);
 
   default:
     break;
@@ -194,19 +195,15 @@ void loop() {
   lastAltitude = currAltitude;
 
   // Turn off the pyros after the fire duration to prevent potential battery drain or damage.
-  if (apogeeFireTime > 0 && (millis() - apogeeFireTime) > PYRO_FIRE_DURATION) {
+  if (digitalRead(PIN_APOGEE) == HIGH && (millis() - apogeeTime) > PYRO_FIRE_DURATION) {
     digitalWrite(PIN_APOGEE, LOW);
-    apogeeFireTime = 0;
   }
-  if (mainFireTime > 0 && (millis() - mainFireTime) > PYRO_FIRE_DURATION) {
+  if (digitalRead(PIN_MAIN) == HIGH && (millis() - mainTime) > PYRO_FIRE_DURATION) {
     digitalWrite(PIN_MAIN, LOW);
-    mainFireTime = 0;
   }
 }
 
 void ARDUINO_ISR_ATTR timerHandlerAltitude() {
-  writeAltitudeBuffer(bmp.readAltitude(SEA_LEVEL_PRESSURE));
-  switchAltitudeBuffer();
   xSemaphoreGiveFromISR(altitudeSemaphore, NULL);
 }
 
@@ -313,104 +310,61 @@ void beepAltiVersion (int majorNbr, int minorNbr) {
   delay(1000);
 }
 
-/*************************************************************************
+void beepAltitude(uint32_t altitude) {
+  char altitudeStr[10]; // Buffer to hold the altitude as a string
+  itoa(altitude, altitudeStr, 10); // Convert the altitude to a string
 
- The following is some Code written by Leo Nutz and modified so that it works
-  Output the maximum achieved altitude (apogee) via flashing LED / Buzzer
+  for (int i = 0; altitudeStr[i] != '\0'; i++) {
+    int digit = altitudeStr[i] - '0'; // Convert character to digit
 
- *************************************************************************/
-void beepAltitude(uint32_t value) {
-  char Apogee_String[5];                      // Create an array with a buffer of 5 digits
-
-  ultoa(value, Apogee_String, 10);            // Convert unsigned long to string array, radix 10 for decimal
-  uint8_t length = strlen(Apogee_String);     // Get string length
-
-  delay(3000);                                // Pause for 3 seconds
-
-  for(uint8_t i = 0; i < length; i++ ) {
-    delay(1000);                              // Pause 1 second for every digit output
-
-    uint8_t digit = (Apogee_String[i] - '0'); // Convert ASCI to actual numerical digit
-    if ( digit == 0 ) {
-      digit = 10;
-    }
-    if ( digit == 0 ) {
-      beepNumTimes(1, true);
-    } else {
+    // one long beep for a zero
+    if (digit > 0) {
       beepNumTimes(digit, false);
+    } else {
+      beepNumTimes(1, true);
+    }
+
+    // If it's not the last digit, wait a bit longer to separate the digits
+    if (altitudeStr[i + 1] != '\0') {
+      delay(1000); // Wait for 1 second between digits
     }
   }
-}
 
-#define CONFIG_START 32
-
-struct ConfigStruct {
-  char app[7];
-  int  majorVersion;
-  int  minorVersion;
-  int  altitude;
-  int  cksum;  
-};
-
-int readPreviousApogee() {
-  ConfigStruct config;
-  
-  int i;
-  for( i = 0; i < sizeof(config); i++ ) {
-    *((char*)&config + i) = EEPROM.read(CONFIG_START + i);
-  }
-  // Verify:
-  if ( strcmp( "AltDuo", config.app ) != 0 ) {
-    return -1;
-  }
-  if ( config.majorVersion != MAJOR_VERSION ) {
-    return -1;
-  }
-  if (config.minorVersion != MINOR_VERSION ) {
-    return -1;
-  }
-  if ( config.cksum != 0xBA ) {
-    return -1;
-  }
-  
-  return config.altitude;
-}
-
-int writePreviousApogee( int altitude ) {
- ConfigStruct config;
- config.app[0] = 'A';
- config.app[1] = 'l';
- config.app[2] = 't';
- config.app[3] = 'D';
- config.app[4] = 'u';
- config.app[5] = 'o';
- config.app[6] = 0;
- config.majorVersion = MAJOR_VERSION;
- config.minorVersion = MINOR_VERSION;
- config.cksum = 0xBA;
- config.altitude = altitude;
- 
- int i;
- for( i=0; i<sizeof(config); i++ ) {
-   EEPROM.write(CONFIG_START+i, *((char*)&config + i));
- }
-}
-
-// Double buffer for altitude
-
-void switchAltitudeBuffer() {
-  altitudeBufferIndex = (altitudeBufferIndex + 1) % altitudeBufferSize;
-}
-
-int readAltitudeBuffer() {
-  int readIndex = (altitudeBufferIndex + 1) % altitudeBufferSize;
-  return altitudeBuffer[readIndex];
-}
-
-void writeAltitudeBuffer(int altitude) {
-  altitudeBuffer[altitudeBufferIndex] = altitude;
+  // Wait a bit longer after the full number has been blinked
+  delay(2000);
 }
 
 bool takeAltitudeSemaphore() {
   return xSemaphoreTake(altitudeSemaphore, 0) == pdTRUE;
+}
+
+// Function to simulate flight data
+long simulateFlightData() {
+  if (isAscending) {
+    // Increment altitude until we reach the apogee
+    simulatedAltitude += SIMULATION_ASCENT_INCREMENT;
+    if (simulatedAltitude >= SIMULATION_APOGEE) {
+      // We've reached apogee, start descending
+      isAscending = false;
+    }
+  } else {
+    // Decrement altitude until we reach the ground
+    simulatedAltitude -= SIMULATION_DESCENT_INCREMENT;
+    if (simulatedAltitude <= 0) {
+      // We've reached the ground, stop decrementing
+      simulatedAltitude = 0;
+    }
+  }
+
+  return simulatedAltitude;
+}
+
+void report() {
+  log("Flight Statistics:");
+  log("Apogee Altitude: " + String(apogeeAltitude * FEET_IN_METER) + " feet");
+  log("Main Parachute Deployment Altitude: " + String(mainAltitude * FEET_IN_METER) + " feet");
+  log("Time to Apogee: " + String(apogeeTime / 1000) + " seconds");
+  log("Time to Main Parachute Deployment: " + String(mainTime / 1000) + " seconds");
+
+  beepAltitude(apogeeAltitude * FEET_IN_METER);
 }

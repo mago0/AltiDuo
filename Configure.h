@@ -44,4 +44,8 @@
 #define LIFTOFF_ALTITUDE      20 // threshold for liftoff
 #define LANDING_ALTITUDE      20 // threshold for landing
 
+#define SIMULATION_ASCENT_INCREMENT 10
+#define SIMULATION_DESCENT_INCREMENT 1
+#define SIMULATION_APOGEE 1000
+
 #endif
